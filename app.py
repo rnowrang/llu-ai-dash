@@ -2,12 +2,11 @@
 import logging
 import os
 from datetime import datetime, timezone
-from functools import lru_cache
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
-from dash import Dash, Input, Output, State, dcc, html, no_update, clientside_callback
+from dash import Dash, Input, Output, dcc, html, no_update, clientside_callback
 import dash_daq as daq
 from flask import jsonify
 from pathlib import Path
@@ -48,12 +47,12 @@ def api_sync():
     try:
         logger.info("Manual sync triggered via API endpoint")
         workbook = ensure_local_workbook(raise_on_error=True)
-        
+
         # Clear the cache to force reload
         if hasattr(load_and_prepare_data, '_cache'):
             load_and_prepare_data._cache.clear()
             logger.info("Cleared data cache")
-        
+
         # Reload data - this will use the new file mtime as cache key
         refreshed = load_and_prepare_data(str(workbook))
         global df
@@ -80,11 +79,17 @@ env_url_sources = {
     "DATA_SOURCE_URL": os.environ.get("DATA_SOURCE_URL"),
     "DOWNLOAD_URL": os.environ.get("DOWNLOAD_URL"),
 }
-logger.debug("Environment URL sources: %s", {k: (v[:50] + "..." if v and len(v) > 50 else v) for k, v in env_url_sources.items()})
+logger.debug(
+    "Environment URL sources: %s",
+    {k: (v[:50] + "..." if v and len(v) > 50 else v) for k, v in env_url_sources.items()}
+)
 
 ONEDRIVE_DOWNLOAD_URL_RAW = os.environ.get("ONEDRIVE_DOWNLOAD_URL", "").strip()
-logger.info("Raw ONEDRIVE_DOWNLOAD_URL from environment: %s", 
-             repr(ONEDRIVE_DOWNLOAD_URL_RAW[:100]) if ONEDRIVE_DOWNLOAD_URL_RAW else "None")
+logger.info(
+    "Raw ONEDRIVE_DOWNLOAD_URL from environment: %s",
+    repr(ONEDRIVE_DOWNLOAD_URL_RAW[:100]) if ONEDRIVE_DOWNLOAD_URL_RAW else "None"
+)
+
 
 # Validate URL - check if it's a valid URL and not a placeholder
 def _is_valid_url(url: str) -> bool:
@@ -107,6 +112,7 @@ def _is_valid_url(url: str) -> bool:
     except Exception as e:
         logger.warning("URL validation exception: %s", e)
         return False
+
 
 ONEDRIVE_DOWNLOAD_URL = ONEDRIVE_DOWNLOAD_URL_RAW if _is_valid_url(ONEDRIVE_DOWNLOAD_URL_RAW) else None
 
@@ -167,36 +173,38 @@ def load_and_prepare_data(path: str) -> pd.DataFrame:
         if not path_obj.exists():
             logger.warning("File does not exist: %s", path)
             return _empty_dataframe()
-        
+
         # Use file modification time as part of cache key to ensure fresh data
         mtime = path_obj.stat().st_mtime
         cache_key = f"{path}:{mtime}"
-        
+
         # Check if we have a cached result for this exact file version
         if not hasattr(load_and_prepare_data, '_cache'):
             load_and_prepare_data._cache = {}
-        
+
         if cache_key in load_and_prepare_data._cache:
             logger.debug("Using cached data for %s (mtime: %s)", path, mtime)
             return load_and_prepare_data._cache[cache_key]
-        
+
         logger.info("Loading fresh data from %s (mtime: %s)", path, mtime)
         df = pd.read_excel(path, sheet_name="Imaging AI")
         df = _normalize_dataframe(df)
         DATA_REFRESHED_AT = datetime.now(timezone.utc)
         LOAD_ERROR = None
-        
+
         # Cache the result with the mtime key
         load_and_prepare_data._cache[cache_key] = df
         # Keep only the most recent cache entry (by mtime)
         if len(load_and_prepare_data._cache) > 1:
             # Remove entries with older mtimes
             current_mtime = mtime
-            keys_to_remove = [k for k in load_and_prepare_data._cache.keys() 
-                             if k != cache_key and k.split(':')[-1] < str(current_mtime)]
+            keys_to_remove = [
+                k for k in load_and_prepare_data._cache.keys()
+                if k != cache_key and k.split(':')[-1] < str(current_mtime)
+            ]
             for k in keys_to_remove:
                 del load_and_prepare_data._cache[k]
-        
+
         logger.info("Loaded %d rows from %s", len(df), path)
         return df
     except Exception as exc:
@@ -215,11 +223,13 @@ def ensure_local_workbook(raise_on_error: bool = False) -> Path:
             if raise_on_error:
                 raise ValueError(error_msg)
             return DATA_PATH
-        
+
         logger.info("Local workbook path: %s", DATA_PATH.resolve())
         try:
-            logger.info("Using ONEDRIVE_DOWNLOAD_URL (length: %d chars): %s...", 
-                       len(ONEDRIVE_DOWNLOAD_URL), ONEDRIVE_DOWNLOAD_URL[:50])
+            logger.info(
+                "Using ONEDRIVE_DOWNLOAD_URL (length: %d chars): %s...",
+                len(ONEDRIVE_DOWNLOAD_URL), ONEDRIVE_DOWNLOAD_URL[:50]
+            )
             target_url = cache_bust_url(ONEDRIVE_DOWNLOAD_URL)
             logger.info("Downloading workbook from OneDrive URL (cache-busted)")
             download_file(target_url, DATA_PATH)
@@ -678,32 +688,32 @@ clientside_callback(
         // Set up direct event listener on the sync button
         const syncButton = document.getElementById('sync-workbook');
         const statusDiv = document.getElementById('sync-status');
-        
+
         if (!syncButton || syncButton.dataset.listenerAttached === 'true') {
             return window.dash_clientside.no_update;
         }
-        
+
         syncButton.dataset.listenerAttached = 'true';
-        
+
         syncButton.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
-            
+
             console.log('Sync button clicked (direct listener)');
-            
+
             const syncingStyle = 'color: #856404; background-color: #fff3cd; padding: 6px 8px; border-radius: 4px;';
             const successStyle = 'color: #0f5132; background-color: #d1e7dd; padding: 6px 8px; border-radius: 4px;';
             const errorStyle = 'color: #842029; background-color: #f8d7da; padding: 6px 8px; border-radius: 4px;';
-            
+
             if (statusDiv) {
                 statusDiv.innerHTML = '<span style="' + syncingStyle + '">Syncing...</span>';
             }
-            
+
             // Disable button during sync
             syncButton.disabled = true;
             syncButton.style.opacity = '0.6';
             syncButton.style.cursor = 'not-allowed';
-            
+
             fetch('/api/sync', {
                 method: 'POST',
                 headers: {
@@ -745,7 +755,7 @@ clientside_callback(
                 syncButton.style.cursor = 'pointer';
             });
         });
-        
+
         return window.dash_clientside.no_update;
     }
     """,
