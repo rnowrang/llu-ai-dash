@@ -83,7 +83,9 @@ def test_build_kpi_cards_reflects_data():
 
 
 def test_load_and_prepare_data_missing(monkeypatch):
-    load_and_prepare_data.cache_clear()
+    # Clear the cache if it exists
+    if hasattr(load_and_prepare_data, '_cache'):
+        load_and_prepare_data._cache.clear()
 
     def _missing(*args, **kwargs):
         raise FileNotFoundError("file not found")
@@ -91,4 +93,6 @@ def test_load_and_prepare_data_missing(monkeypatch):
     monkeypatch.setattr("app.pd.read_excel", _missing)
     df = load_and_prepare_data("missing.xlsx")
     assert df.empty
-    load_and_prepare_data.cache_clear()
+    # Clear the cache again
+    if hasattr(load_and_prepare_data, '_cache'):
+        load_and_prepare_data._cache.clear()
