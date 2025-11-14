@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
 
 import requests
 
@@ -15,4 +14,3 @@ def download_file(url: str, destination: Path) -> None:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     handle.write(chunk)
-

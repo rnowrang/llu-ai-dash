@@ -1,8 +1,4 @@
-import sys
-from pathlib import Path
 import pandas as pd
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from app import (
     build_category_stack,
@@ -96,4 +92,3 @@ def test_load_and_prepare_data_missing(monkeypatch):
     df = load_and_prepare_data("missing.xlsx")
     assert df.empty
     load_and_prepare_data.cache_clear()
-

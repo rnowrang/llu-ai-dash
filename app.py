@@ -104,7 +104,7 @@ def ensure_local_workbook() -> Path:
         try:
             logger.info("Downloading workbook from OneDrive URL")
             download_file(ONEDRIVE_DOWNLOAD_URL, DATA_PATH)
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to download workbook from OneDrive")
     return DATA_PATH
 
