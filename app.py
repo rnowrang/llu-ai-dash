@@ -2,18 +2,17 @@
 import logging
 import os
 from datetime import datetime, timezone
-from functools import lru_cache
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
-from dash import Dash, Input, Output, dcc, html, no_update
+from dash import Dash, Input, Output, dcc, html, no_update, clientside_callback
 import dash_daq as daq
 from flask import jsonify
 from pathlib import Path
 from dotenv import load_dotenv
 
-from data_sync import download_file
+from data_sync import cache_bust_url, download_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,8 +40,92 @@ app = Dash(__name__)
 app.title = "LLU Imaging AI — Mini Dashboard"
 server = app.server
 
+
+@server.route("/api/sync", methods=["POST"])
+def api_sync():
+    """Manual sync endpoint to bypass browser extension issues."""
+    try:
+        logger.info("Manual sync triggered via API endpoint")
+        workbook = ensure_local_workbook(raise_on_error=True)
+
+        # Clear the cache to force reload
+        if hasattr(load_and_prepare_data, '_cache'):
+            load_and_prepare_data._cache.clear()
+            logger.info("Cleared data cache")
+
+        # Reload data - this will use the new file mtime as cache key
+        refreshed = load_and_prepare_data(str(workbook))
+        global df
+        df = refreshed
+        timestamp = datetime.now(timezone.utc).isoformat()
+        mtime = datetime.fromtimestamp(workbook.stat().st_mtime, timezone.utc).isoformat()
+        logger.info("Sync complete: %d rows loaded, file mtime: %s", len(refreshed), mtime)
+        return jsonify({
+            "status": "success",
+            "timestamp": timestamp,
+            "file_mtime": mtime,
+            "rows_loaded": len(refreshed),
+        })
+    except Exception as exc:
+        logger.exception("API sync failed")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
 DATA_PATH = Path(os.environ.get("DATA_PATH", "LLU Imaging AI 2025.xlsx"))
-ONEDRIVE_DOWNLOAD_URL = os.environ.get("ONEDRIVE_DOWNLOAD_URL")
+
+# Debug: Log all environment variables that might contain URLs
+env_url_sources = {
+    "ONEDRIVE_DOWNLOAD_URL": os.environ.get("ONEDRIVE_DOWNLOAD_URL"),
+    "DATA_SOURCE_URL": os.environ.get("DATA_SOURCE_URL"),
+    "DOWNLOAD_URL": os.environ.get("DOWNLOAD_URL"),
+}
+logger.debug(
+    "Environment URL sources: %s",
+    {k: (v[:50] + "..." if v and len(v) > 50 else v) for k, v in env_url_sources.items()}
+)
+
+ONEDRIVE_DOWNLOAD_URL_RAW = os.environ.get("ONEDRIVE_DOWNLOAD_URL", "").strip()
+logger.info(
+    "Raw ONEDRIVE_DOWNLOAD_URL from environment: %s",
+    repr(ONEDRIVE_DOWNLOAD_URL_RAW[:100]) if ONEDRIVE_DOWNLOAD_URL_RAW else "None"
+)
+
+
+# Validate URL - check if it's a valid URL and not a placeholder
+def _is_valid_url(url: str) -> bool:
+    """Check if URL is valid and not a placeholder."""
+    if not url:
+        return False
+    # Check for common placeholder patterns
+    placeholder_patterns = ["<>", "…", "example.com", "your-url", "placeholder"]
+    if any(pattern in url.lower() for pattern in placeholder_patterns):
+        logger.warning("URL contains placeholder pattern: %s", url[:100])
+        return False
+    # Basic URL validation
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        is_valid = parsed.scheme in ("http", "https") and parsed.netloc
+        if not is_valid:
+            logger.warning("URL failed basic validation: scheme=%s, netloc=%s", parsed.scheme, parsed.netloc)
+        return is_valid
+    except Exception as e:
+        logger.warning("URL validation exception: %s", e)
+        return False
+
+
+ONEDRIVE_DOWNLOAD_URL = ONEDRIVE_DOWNLOAD_URL_RAW if _is_valid_url(ONEDRIVE_DOWNLOAD_URL_RAW) else None
+
+if ONEDRIVE_DOWNLOAD_URL_RAW and not ONEDRIVE_DOWNLOAD_URL:
+    logger.warning(
+        "ONEDRIVE_DOWNLOAD_URL appears to be invalid or contains placeholder text: %s. "
+        "Sync from OneDrive will be disabled. Please check your .env file and system environment variables.",
+        ONEDRIVE_DOWNLOAD_URL_RAW[:100] + "..." if len(ONEDRIVE_DOWNLOAD_URL_RAW) > 100 else ONEDRIVE_DOWNLOAD_URL_RAW
+    )
+elif ONEDRIVE_DOWNLOAD_URL:
+    logger.info("ONEDRIVE_DOWNLOAD_URL is valid and set (length: %d chars)", len(ONEDRIVE_DOWNLOAD_URL))
+else:
+    logger.info("ONEDRIVE_DOWNLOAD_URL is not set - sync from OneDrive is disabled")
 
 
 def _empty_dataframe() -> pd.DataFrame:
@@ -82,14 +165,46 @@ def _normalize_dataframe(raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@lru_cache(maxsize=1)
 def load_and_prepare_data(path: str) -> pd.DataFrame:
+    """Load and prepare data from Excel file. Cache is based on file mtime."""
     global DATA_REFRESHED_AT, LOAD_ERROR
     try:
+        path_obj = Path(path)
+        if not path_obj.exists():
+            logger.warning("File does not exist: %s", path)
+            return _empty_dataframe()
+
+        # Use file modification time as part of cache key to ensure fresh data
+        mtime = path_obj.stat().st_mtime
+        cache_key = f"{path}:{mtime}"
+
+        # Check if we have a cached result for this exact file version
+        if not hasattr(load_and_prepare_data, '_cache'):
+            load_and_prepare_data._cache = {}
+
+        if cache_key in load_and_prepare_data._cache:
+            logger.debug("Using cached data for %s (mtime: %s)", path, mtime)
+            return load_and_prepare_data._cache[cache_key]
+
+        logger.info("Loading fresh data from %s (mtime: %s)", path, mtime)
         df = pd.read_excel(path, sheet_name="Imaging AI")
         df = _normalize_dataframe(df)
         DATA_REFRESHED_AT = datetime.now(timezone.utc)
         LOAD_ERROR = None
+
+        # Cache the result with the mtime key
+        load_and_prepare_data._cache[cache_key] = df
+        # Keep only the most recent cache entry (by mtime)
+        if len(load_and_prepare_data._cache) > 1:
+            # Remove entries with older mtimes
+            current_mtime = mtime
+            keys_to_remove = [
+                k for k in load_and_prepare_data._cache.keys()
+                if k != cache_key and k.split(':')[-1] < str(current_mtime)
+            ]
+            for k in keys_to_remove:
+                del load_and_prepare_data._cache[k]
+
         logger.info("Loaded %d rows from %s", len(df), path)
         return df
     except Exception as exc:
@@ -99,13 +214,29 @@ def load_and_prepare_data(path: str) -> pd.DataFrame:
         return _empty_dataframe()
 
 
-def ensure_local_workbook() -> Path:
+def ensure_local_workbook(raise_on_error: bool = False) -> Path:
     if ONEDRIVE_DOWNLOAD_URL:
+        # Double-check URL validity before attempting download
+        if not _is_valid_url(ONEDRIVE_DOWNLOAD_URL):
+            error_msg = f"ONEDRIVE_DOWNLOAD_URL is invalid: {ONEDRIVE_DOWNLOAD_URL[:100]}"
+            logger.error(error_msg)
+            if raise_on_error:
+                raise ValueError(error_msg)
+            return DATA_PATH
+
+        logger.info("Local workbook path: %s", DATA_PATH.resolve())
         try:
-            logger.info("Downloading workbook from OneDrive URL")
-            download_file(ONEDRIVE_DOWNLOAD_URL, DATA_PATH)
+            logger.info(
+                "Using ONEDRIVE_DOWNLOAD_URL (length: %d chars): %s...",
+                len(ONEDRIVE_DOWNLOAD_URL), ONEDRIVE_DOWNLOAD_URL[:50]
+            )
+            target_url = cache_bust_url(ONEDRIVE_DOWNLOAD_URL)
+            logger.info("Downloading workbook from OneDrive URL (cache-busted)")
+            download_file(target_url, DATA_PATH)
         except Exception:
             logger.exception("Failed to download workbook from OneDrive")
+            if raise_on_error:
+                raise
     return DATA_PATH
 
 
@@ -150,10 +281,11 @@ def filter_dataframe(
 
 def build_treemap(dff: pd.DataFrame) -> px.treemap:
     title = "Treemap: Domain → Section → Category → Solution"
-    return px.treemap(
+    fig = px.treemap(
         dff, path=["Domain", "Rad Section", "Category", "Name"],
         color="Rad Section", title=title
     )
+    return _with_mode_default(fig)
 
 
 def build_section_bar(dff: pd.DataFrame) -> px.bar:
@@ -163,7 +295,7 @@ def build_section_bar(dff: pd.DataFrame) -> px.bar:
         .reset_index(name="Count")
         .sort_values("Count", ascending=False)
     )
-    return px.bar(counts, x="Rad Section", y="Count", title="AI Solutions by Section")
+    return _with_mode_default(px.bar(counts, x="Rad Section", y="Count", title="AI Solutions by Section"))
 
 
 def build_platform_bar(dff: pd.DataFrame) -> px.bar:
@@ -173,10 +305,11 @@ def build_platform_bar(dff: pd.DataFrame) -> px.bar:
         .reset_index(name="Count")
         .sort_values("Count", ascending=True)
     )
-    return px.bar(
+    fig = px.bar(
         counts, x="Count", y="Platform", orientation="h",
         title="AI Solutions by Platform"
     )
+    return _with_mode_default(fig)
 
 
 def build_category_stack(dff: pd.DataFrame) -> px.bar:
@@ -185,10 +318,11 @@ def build_category_stack(dff: pd.DataFrame) -> px.bar:
         .size()
         .reset_index(name="Count")
     )
-    return px.bar(
+    fig = px.bar(
         counts, x="Category", y="Count", color="Rad Section",
         barmode="stack", title="AI Solutions by Category (stacked by Section)"
     )
+    return _with_mode_default(fig)
 
 
 def build_timeline(dff: pd.DataFrame) -> px.timeline:
@@ -213,6 +347,23 @@ def build_timeline(dff: pd.DataFrame) -> px.timeline:
         title="Adoption Timeline"
     )
     fig.update_yaxes(autorange="reversed")
+    return _with_mode_default(fig)
+
+
+def _with_mode_default(fig):
+    """Ensure traces that support mode have it set to prevent Graph.react.js errors.
+
+    Note: Some trace types (like Treemap) don't support mode, so Graph.react.js
+    may still error on hover for those. This is a Plotly/Dash limitation.
+    """
+    for i, trace in enumerate(getattr(fig, "data", [])):
+        if trace is not None:
+            mode = getattr(trace, "mode", None)
+            if mode is None:
+                try:
+                    setattr(trace, "mode", "")
+                except (ValueError, AttributeError):
+                    pass
     return fig
 
 
@@ -509,6 +660,16 @@ app.layout = html.Div(
     Input("data-refresh", "data"),
 )
 def update_figs(active_only, domain, status, section, platform, _):
+    # Reload data fresh to ensure we're using the latest file (cache handles mtime-based caching)
+    global df
+    current_df = load_and_prepare_data(str(WORKBOOK_PATH))
+    # Update global df if row count changed (indicates file was updated)
+    old_len = len(df)
+    if len(current_df) != old_len:
+        df = current_df
+        logger.info("Data updated in update_figs: %d rows (was %d)", len(df), old_len)
+    else:
+        df = current_df  # Still update to ensure we have the latest cached version
     dff = filter_dataframe(df, active_only, domain, status, section, platform)
     figures = (
         build_treemap(dff),
@@ -520,43 +681,88 @@ def update_figs(active_only, domain, status, section, platform, _):
     return (*figures, build_kpi_cards(dff))
 
 
-@app.callback(
+# Setup direct event listener on sync button to bypass Dash callbacks and avoid extension interference
+clientside_callback(
+    """
+    function(_) {
+        // Set up direct event listener on the sync button
+        const syncButton = document.getElementById('sync-workbook');
+        const statusDiv = document.getElementById('sync-status');
+
+        if (!syncButton || syncButton.dataset.listenerAttached === 'true') {
+            return window.dash_clientside.no_update;
+        }
+
+        syncButton.dataset.listenerAttached = 'true';
+
+        syncButton.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            console.log('Sync button clicked (direct listener)');
+
+            const syncingStyle = 'color: #856404; background-color: #fff3cd; padding: 6px 8px; border-radius: 4px;';
+            const successStyle = 'color: #0f5132; background-color: #d1e7dd; padding: 6px 8px; border-radius: 4px;';
+            const errorStyle = 'color: #842029; background-color: #f8d7da; padding: 6px 8px; border-radius: 4px;';
+
+            if (statusDiv) {
+                statusDiv.innerHTML = '<span style="' + syncingStyle + '">Syncing...</span>';
+            }
+
+            // Disable button during sync
+            syncButton.disabled = true;
+            syncButton.style.opacity = '0.6';
+            syncButton.style.cursor = 'not-allowed';
+
+            fetch('/api/sync', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                cache: 'no-cache'
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                return response.json();
+            })
+            .then(data => {
+                console.log('Sync response:', data);
+                if (data.status === 'success') {
+                    const timestamp = new Date(data.timestamp).toLocaleString();
+                    const msg = 'Workbook refreshed at ' + timestamp + ' (local file mtime ' + data.file_mtime + ')';
+                    if (statusDiv) {
+                        statusDiv.innerHTML = '<span style="' + successStyle + '">' + msg + '</span>';
+                    }
+                    // Reload after short delay
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 1000);
+                } else {
+                    throw new Error(data.message || 'Sync failed');
+                }
+            })
+            .catch(error => {
+                console.error('Sync error:', error);
+                const msg = 'Download failed: ' + (error.message || 'Unknown error');
+                if (statusDiv) {
+                    statusDiv.innerHTML = '<span style="' + errorStyle + '">' + msg + '</span>';
+                }
+                // Re-enable button on error
+                syncButton.disabled = false;
+                syncButton.style.opacity = '1';
+                syncButton.style.cursor = 'pointer';
+            });
+        });
+
+        return window.dash_clientside.no_update;
+    }
+    """,
     Output("sync-status", "children"),
-    Output("data-refresh", "data"),
-    Input("sync-workbook", "n_clicks"),
-    prevent_initial_call=True,
+    Input("sync-workbook", "id"),  # Trigger on component mount
+    prevent_initial_call=False,  # Run on initial load to attach listener
 )
-def sync_workbook(n_clicks):
-    if not n_clicks:
-        return no_update, no_update
-    if not ONEDRIVE_DOWNLOAD_URL:
-        return html.Span(
-            "Set ONEDRIVE_DOWNLOAD_URL to enable download",
-            style={"color": "#664d03", "backgroundColor": "#fff3cd", "padding": "6px 8px", "borderRadius": "4px"},
-        ), no_update
-    try:
-        workbook = ensure_local_workbook()
-        load_and_prepare_data.cache_clear()
-        refreshed = load_and_prepare_data(str(workbook))
-        global df
-        df = refreshed
-        timestamp = datetime.now(timezone.utc).isoformat()
-        return (
-            html.Span(
-                f"Workbook refreshed at {timestamp}",
-                style={"color": "#0f5132", "backgroundColor": "#d1e7dd", "padding": "6px 8px", "borderRadius": "4px"},
-            ),
-            {"signal": timestamp},
-        )
-    except Exception as exc:
-        logger.exception("Manual sync attempt failed")
-        return (
-            html.Span(
-                f"Download failed: {exc}",
-                style={"color": "#842029", "backgroundColor": "#f8d7da", "padding": "6px 8px", "borderRadius": "4px"},
-            ),
-            no_update,
-        )
 
 
 @app.callback(
