@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 from dash import Dash, Input, Output, dcc, html, no_update, clientside_callback
-import dash_daq as daq
 from flask import jsonify
 from pathlib import Path
 from dotenv import load_dotenv
@@ -151,6 +150,41 @@ def _normalize_dataframe(raw: pd.DataFrame) -> pd.DataFrame:
     for column in trim_columns:
         df[column] = df[column].astype(str).str.strip()
 
+    # Split multi-value columns (support both '/' and ',' as delimiters)
+    # Columns that can have multiple values separated by delimiters
+    multi_value_columns = ["Platform", "Rad Section", "Domain", "Category"]
+
+    for column in multi_value_columns:
+        if column in df.columns:
+            # Replace comma with slash for consistent splitting
+            # This handles both "Value1/Value2" and "Value1, Value2" formats
+            df[column] = df[column].str.replace(',', '/', regex=False)
+            # Split on '/' and create list of values, trimming whitespace
+
+            def _split_and_clean(x):
+                if isinstance(x, list):
+                    return [val.strip() for val in x if val.strip()]
+                elif pd.notna(x) and str(x).strip() != 'nan':
+                    return [str(x).strip()]
+                else:
+                    return []
+            df[column] = df[column].str.split('/').apply(_split_and_clean)
+            # Ensure we have at least one value (use original if list is empty)
+            df[column] = df[column].apply(lambda x: x if x else [np.nan])
+
+    # Expand rows: if a cell has multiple values, create a row for each value
+    # Use pandas explode() which handles this elegantly
+    # We'll explode each column sequentially to create all combinations
+    for column in multi_value_columns:
+        if column in df.columns:
+            df = df.explode(column, ignore_index=True)
+
+    # Convert back to string format (now single values)
+    for column in trim_columns:
+        df[column] = df[column].astype(str).str.strip()
+        # Replace 'nan' strings with empty string
+        df[column] = df[column].replace('nan', '')
+
     for column in ["Starting Date", "Ending Date"]:
         if column in df:
             df[column] = pd.to_datetime(df[column], errors="coerce")
@@ -242,7 +276,6 @@ def ensure_local_workbook(raise_on_error: bool = False) -> Path:
 
 def default_filter_state() -> dict:
     return {
-        "active_only": True,
         "domain": None,
         "status": ["Active"],
         "section": None,
@@ -256,7 +289,6 @@ df = load_and_prepare_data(str(WORKBOOK_PATH))
 
 def filter_dataframe(
     dataset: pd.DataFrame,
-    active_only: bool,
     domain: list | None,
     status: list | None,
     section: list | None,
@@ -264,16 +296,20 @@ def filter_dataframe(
 ) -> pd.DataFrame:
     dff = dataset.copy()
 
-    if active_only:
-        dff = dff[dff["Active Flag"] == "Active"]
-    elif status:
+    # Filter by status if provided and not empty
+    if status and len(status) > 0:
         dff = dff[dff["Active Flag"].isin(status)]
 
-    if domain:
+    # Filter by domain if provided and not empty
+    if domain and len(domain) > 0:
         dff = dff[dff["Domain"].isin(domain)]
-    if section:
+
+    # Filter by section if provided and not empty
+    if section and len(section) > 0:
         dff = dff[dff["Rad Section"].isin(section)]
-    if platform:
+
+    # Filter by platform if provided and not empty
+    if platform and len(platform) > 0:
         dff = dff[dff["Platform"].isin(platform)]
 
     return dff
@@ -281,10 +317,29 @@ def filter_dataframe(
 
 def build_treemap(dff: pd.DataFrame) -> px.treemap:
     title = "Treemap: Domain → Section → Category → Solution"
-    fig = px.treemap(
-        dff, path=["Domain", "Rad Section", "Category", "Name"],
-        color="Rad Section", title=title
-    )
+    # Filter out rows with missing/empty values in path columns
+    path_columns = ["Domain", "Rad Section", "Category", "Name"]
+    treemap_df = dff.copy()
+
+    # Remove rows where any path column is empty, NaN, or whitespace-only
+    for col in path_columns:
+        if col in treemap_df.columns:
+            treemap_df = treemap_df[
+                treemap_df[col].astype(str).str.strip().fillna('').ne('')
+            ]
+
+    # If dataframe is empty after filtering, return empty treemap
+    if len(treemap_df) == 0:
+        fig = px.treemap(
+            pd.DataFrame(columns=path_columns),
+            path=path_columns,
+            title=title
+        )
+    else:
+        fig = px.treemap(
+            treemap_df, path=path_columns,
+            color="Rad Section", title=title
+        )
     return _with_mode_default(fig)
 
 
@@ -368,13 +423,29 @@ def _with_mode_default(fig):
 
 
 def build_kpi_cards(dff: pd.DataFrame) -> html.Div:
-    total = len(dff)
-    active = int((dff["Active Flag"] == "Active").sum())
-    active_pct = round((active / total) * 100, 1) if total else 0.0
-    today = pd.Timestamp(datetime.now(timezone.utc).date())
-    upcoming = int(
-        dff["Starting Date"].ge(today).sum() if "Starting Date" in dff else 0
-    )
+    # Count unique solutions by Name to avoid double-counting when rows are expanded
+    # for multiple values in Platform, Domain, Section, or Category columns
+    if "Name" in dff.columns and len(dff) > 0:
+        unique_solutions = dff["Name"].nunique()
+        # For active count, get unique solution names that are Active
+        active_solutions_df = dff[dff["Active Flag"] == "Active"]
+        active_unique = active_solutions_df["Name"].nunique() if len(active_solutions_df) > 0 else 0
+        active_pct = round((active_unique / unique_solutions) * 100, 1) if unique_solutions else 0.0
+        # For upcoming launches, count unique solutions with upcoming start dates
+        today = pd.Timestamp(datetime.now(timezone.utc).date())
+        upcoming_df = dff[dff["Starting Date"].ge(today)] if "Starting Date" in dff else pd.DataFrame()
+        upcoming = upcoming_df["Name"].nunique() if len(upcoming_df) > 0 else 0
+        total = unique_solutions
+        active = active_unique
+    else:
+        # Fallback to row count if Name column doesn't exist
+        total = len(dff)
+        active = int((dff["Active Flag"] == "Active").sum())
+        active_pct = round((active / total) * 100, 1) if total else 0.0
+        today = pd.Timestamp(datetime.now(timezone.utc).date())
+        upcoming = int(
+            dff["Starting Date"].ge(today).sum() if "Starting Date" in dff else 0
+        )
 
     cards = [
         {
@@ -425,12 +496,9 @@ def render_filter_summary(filter_state: dict | None) -> html.Span:
     state = filter_state or default_filter_state()
     parts = []
 
-    if state.get("active_only"):
-        parts.append("Active solutions only")
-    else:
-        statuses = state.get("status") or []
-        status_label = ", ".join(statuses) if statuses else "Any status"
-        parts.append(f"Status: {status_label}")
+    statuses = state.get("status") or []
+    status_label = ", ".join(statuses) if statuses else "Any status"
+    parts.append(f"Status: {status_label}")
 
     for key, label in (("domain", "Domain"), ("section", "Section"), ("platform", "Platform")):
         values = state.get(key)
@@ -486,15 +554,6 @@ app.layout = html.Div(
             [
                 html.Div(
                     [
-                        daq.BooleanSwitch(
-                            id="active_only",
-                            on=True,
-                            color="#2c7be5",
-                        ),
-                        html.Span(
-                            " Show only Active Solutions",
-                            style={"marginLeft": 8, "fontWeight": 600},
-                        ),
                         html.Button(
                             "Reset filters",
                             id="reset-filters",
@@ -562,7 +621,7 @@ app.layout = html.Div(
                         ),
                         html.Div(
                             [
-                                html.Label("Status (disabled when Active-only is ON)"),
+                                html.Label("Status"),
                                 dcc.Dropdown(
                                     options=[
                                         {"label": s, "value": s}
@@ -652,14 +711,13 @@ app.layout = html.Div(
     Output("cat_stack", "figure"),
     Output("timeline", "figure"),
     Output("kpi-cards", "children"),
-    Input("active_only", "on"),
     Input("domain", "value"),
     Input("status", "value"),
     Input("section", "value"),
     Input("platform", "value"),
     Input("data-refresh", "data"),
 )
-def update_figs(active_only, domain, status, section, platform, _):
+def update_figs(domain, status, section, platform, _):
     # Reload data fresh to ensure we're using the latest file (cache handles mtime-based caching)
     global df
     current_df = load_and_prepare_data(str(WORKBOOK_PATH))
@@ -670,7 +728,7 @@ def update_figs(active_only, domain, status, section, platform, _):
         logger.info("Data updated in update_figs: %d rows (was %d)", len(df), old_len)
     else:
         df = current_df  # Still update to ensure we have the latest cached version
-    dff = filter_dataframe(df, active_only, domain, status, section, platform)
+    dff = filter_dataframe(df, domain, status, section, platform)
     figures = (
         build_treemap(dff),
         build_section_bar(dff),
@@ -767,15 +825,13 @@ clientside_callback(
 
 @app.callback(
     Output("filter-store", "data"),
-    Input("active_only", "on"),
     Input("domain", "value"),
     Input("status", "value"),
     Input("section", "value"),
     Input("platform", "value"),
 )
-def cache_filters(active_only, domain, status, section, platform):
+def cache_filters(domain, status, section, platform):
     return {
-        "active_only": active_only,
         "domain": domain,
         "status": status,
         "section": section,

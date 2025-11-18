@@ -52,17 +52,19 @@ def test_builders_handle_minimal_dataframe():
 
 
 def test_update_figures_returns_all_slots():
-    figures = update_figs(True, None, None, None, None, None)
+    figures = update_figs(None, None, None, None, None)
     assert isinstance(figures, tuple)
     assert len(figures) == 6
 
 
 def test_filter_dataframe_applies_filters():
     dff = _sample_data()
-    filtered = filter_dataframe(dff, False, ["Imaging AI"], ["Active"], ["Clinical AI"], None)
-    assert len(filtered) == 0
-    filtered = filter_dataframe(dff, True, None, None, None, None)
-    assert len(filtered) == 1
+    # Test filtering by domain, status, and section
+    filtered = filter_dataframe(dff, ["Imaging AI"], ["Active"], ["Clinical AI"], None)
+    assert len(filtered) == 0  # No rows match all three filters
+    # Test filtering by status only
+    filtered = filter_dataframe(dff, None, ["Active"], None, None)
+    assert len(filtered) == 1  # One row has Active status
 
 
 def test_build_kpi_cards_reflects_data():
