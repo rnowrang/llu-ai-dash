@@ -65,9 +65,17 @@ def api_sync():
             "file_mtime": mtime,
             "rows_loaded": len(refreshed),
         })
+    except PermissionError as exc:
+        error_msg = (
+            "Cannot download workbook: The file is currently open in another program. "
+            "Please close Excel (or any other program using the file) and try again."
+        )
+        logger.error("API sync failed: %s", error_msg)
+        return jsonify({"status": "error", "message": error_msg}), 500
     except Exception as exc:
-        logger.exception("API sync failed")
-        return jsonify({"status": "error", "message": str(exc)}), 500
+        error_msg = str(exc)
+        logger.exception("API sync failed: %s", error_msg)
+        return jsonify({"status": "error", "message": error_msg}), 500
 
 
 DATA_PATH = Path(os.environ.get("DATA_PATH", "LLU Imaging AI 2025.xlsx"))
@@ -780,10 +788,14 @@ clientside_callback(
                 cache: 'no-cache'
             })
             .then(response => {
-                if (!response.ok) {
-                    throw new Error('HTTP ' + response.status);
-                }
-                return response.json();
+                // Try to parse JSON even for error responses to get the error message
+                return response.json().then(data => {
+                    if (!response.ok) {
+                        // Server returned an error with a message
+                        throw new Error(data.message || 'HTTP ' + response.status);
+                    }
+                    return data;
+                });
             })
             .then(data => {
                 console.log('Sync response:', data);
@@ -803,7 +815,8 @@ clientside_callback(
             })
             .catch(error => {
                 console.error('Sync error:', error);
-                const msg = 'Download failed: ' + (error.message || 'Unknown error');
+                // Use the error message directly (it should contain the user-friendly message)
+                const msg = error.message || 'Download failed: Unknown error';
                 if (statusDiv) {
                     statusDiv.innerHTML = '<span style="' + errorStyle + '">' + msg + '</span>';
                 }
