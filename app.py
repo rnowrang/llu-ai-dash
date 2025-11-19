@@ -65,7 +65,7 @@ def api_sync():
             "file_mtime": mtime,
             "rows_loaded": len(refreshed),
         })
-    except PermissionError as exc:
+    except PermissionError:
         error_msg = (
             "Cannot download workbook: The file is currently open in another program. "
             "Please close Excel (or any other program using the file) and try again."
@@ -323,7 +323,7 @@ def filter_dataframe(
     return dff
 
 
-def build_treemap(dff: pd.DataFrame) -> px.treemap:
+def build_treemap(dff: pd.DataFrame, color_by: str = "Rad Section") -> px.treemap:
     title = "Treemap: Domain → Section → Category → Solution"
     # Filter out rows with missing/empty values in path columns
     path_columns = ["Domain", "Rad Section", "Category", "Name"]
@@ -336,6 +336,10 @@ def build_treemap(dff: pd.DataFrame) -> px.treemap:
                 treemap_df[col].astype(str).str.strip().fillna('').ne('')
             ]
 
+    # Validate color_by column exists
+    if color_by not in treemap_df.columns:
+        color_by = "Rad Section"
+
     # If dataframe is empty after filtering, return empty treemap
     if len(treemap_df) == 0:
         fig = px.treemap(
@@ -346,28 +350,65 @@ def build_treemap(dff: pd.DataFrame) -> px.treemap:
     else:
         fig = px.treemap(
             treemap_df, path=path_columns,
-            color="Rad Section", title=title
+            color=color_by, title=title
+        )
+        # Add legend on the right side and adjust title positioning
+        fig.update_layout(
+            title=dict(
+                x=0.5,
+                xanchor="center",
+                font=dict(size=16),
+            ),
+            legend=dict(
+                orientation="v",
+                yanchor="top",
+                y=1,
+                xanchor="left",
+                x=1.02,
+                title=dict(text=color_by, font=dict(size=12)),
+            ),
+            margin=dict(r=150, t=60),  # Add right margin for legend, top margin for title
         )
     return _with_mode_default(fig)
 
 
 def build_section_bar(dff: pd.DataFrame) -> px.bar:
-    counts = (
-        dff.groupby("Rad Section")
-        .size()
-        .reset_index(name="Count")
-        .sort_values("Count", ascending=False)
-    )
+    # Count unique solutions by Section (not total rows)
+    if "Name" in dff.columns and len(dff) > 0:
+        counts = (
+            dff.drop_duplicates(subset=["Name"])
+            .groupby("Rad Section")
+            .size()
+            .reset_index(name="Count")
+            .sort_values("Count", ascending=False)
+        )
+    else:
+        counts = (
+            dff.groupby("Rad Section")
+            .size()
+            .reset_index(name="Count")
+            .sort_values("Count", ascending=False)
+        )
     return _with_mode_default(px.bar(counts, x="Rad Section", y="Count", title="AI Solutions by Section"))
 
 
 def build_platform_bar(dff: pd.DataFrame) -> px.bar:
-    counts = (
-        dff.groupby("Platform")
-        .size()
-        .reset_index(name="Count")
-        .sort_values("Count", ascending=True)
-    )
+    # Count unique solutions by Platform (not total rows)
+    if "Name" in dff.columns and len(dff) > 0:
+        counts = (
+            dff.drop_duplicates(subset=["Name"])
+            .groupby("Platform")
+            .size()
+            .reset_index(name="Count")
+            .sort_values("Count", ascending=True)
+        )
+    else:
+        counts = (
+            dff.groupby("Platform")
+            .size()
+            .reset_index(name="Count")
+            .sort_values("Count", ascending=True)
+        )
     fig = px.bar(
         counts, x="Count", y="Platform", orientation="h",
         title="AI Solutions by Platform"
@@ -376,11 +417,20 @@ def build_platform_bar(dff: pd.DataFrame) -> px.bar:
 
 
 def build_category_stack(dff: pd.DataFrame) -> px.bar:
-    counts = (
-        dff.groupby(["Category", "Rad Section"])
-        .size()
-        .reset_index(name="Count")
-    )
+    # Count unique solutions by Category and Section (not total rows)
+    if "Name" in dff.columns and len(dff) > 0:
+        counts = (
+            dff.drop_duplicates(subset=["Name"])
+            .groupby(["Category", "Rad Section"])
+            .size()
+            .reset_index(name="Count")
+        )
+    else:
+        counts = (
+            dff.groupby(["Category", "Rad Section"])
+            .size()
+            .reset_index(name="Count")
+        )
     fig = px.bar(
         counts, x="Category", y="Count", color="Rad Section",
         barmode="stack", title="AI Solutions by Category (stacked by Section)"
@@ -398,7 +448,12 @@ def build_timeline(dff: pd.DataFrame) -> px.timeline:
             title="Adoption Timeline (no data)",
         )
 
-    t = dff.copy()
+    # Deduplicate by Name to show each solution only once in timeline
+    if "Name" in dff.columns and len(dff) > 0:
+        t = dff.drop_duplicates(subset=["Name"], keep="first").copy()
+    else:
+        t = dff.copy()
+
     end_fill = pd.Timestamp(datetime.now(timezone.utc).date())
     t["EndPlot"] = t["Ending Date"].fillna(end_fill)
     t = t.dropna(subset=["Starting Date"])
@@ -689,7 +744,48 @@ app.layout = html.Div(
         ),
         html.Div(
             [
-                dcc.Graph(id="treemap"),
+                html.Div(
+                    [
+                        dcc.Graph(id="treemap"),
+                        html.Div(
+                            [
+                                html.Label(
+                                    "Color by:",
+                                    style={
+                                        "fontWeight": 600,
+                                        "marginRight": "8px",
+                                        "fontSize": "0.85rem",
+                                        "color": "#333",
+                                    },
+                                ),
+                                dcc.RadioItems(
+                                    id="color-by",
+                                    options=[
+                                        {"label": "Section", "value": "Rad Section"},
+                                        {"label": "Platform", "value": "Platform"},
+                                    ],
+                                    value="Rad Section",
+                                    inline=True,
+                                    inputStyle={"marginRight": "4px", "marginLeft": "8px"},
+                                    labelStyle={"marginRight": "12px", "cursor": "pointer", "fontSize": "0.85rem"},
+                                    style={"display": "inline-block"},
+                                ),
+                            ],
+                            style={
+                                "position": "absolute",
+                                "top": "10px",
+                                "left": "10px",
+                                "backgroundColor": "rgba(255, 255, 255, 0.95)",
+                                "padding": "6px 10px",
+                                "borderRadius": "6px",
+                                "border": "1px solid #e3e3e3",
+                                "boxShadow": "0 2px 4px rgba(0,0,0,0.1)",
+                                "zIndex": 10,
+                            },
+                        ),
+                    ],
+                    style={"position": "relative"},
+                ),
                 html.Div(
                     [
                         html.Div([dcc.Graph(id="bar_section")], style={"flex": 1, "minWidth": 360}),
@@ -723,9 +819,10 @@ app.layout = html.Div(
     Input("status", "value"),
     Input("section", "value"),
     Input("platform", "value"),
+    Input("color-by", "value"),
     Input("data-refresh", "data"),
 )
-def update_figs(domain, status, section, platform, _):
+def update_figs(domain, status, section, platform, color_by, _):
     # Reload data fresh to ensure we're using the latest file (cache handles mtime-based caching)
     global df
     current_df = load_and_prepare_data(str(WORKBOOK_PATH))
@@ -737,8 +834,11 @@ def update_figs(domain, status, section, platform, _):
     else:
         df = current_df  # Still update to ensure we have the latest cached version
     dff = filter_dataframe(df, domain, status, section, platform)
+    # Default to "Rad Section" if color_by is None or invalid
+    if not color_by or color_by not in ["Rad Section", "Platform"]:
+        color_by = "Rad Section"
     figures = (
-        build_treemap(dff),
+        build_treemap(dff, color_by),
         build_section_bar(dff),
         build_platform_bar(dff),
         build_category_stack(dff),
