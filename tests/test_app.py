@@ -52,7 +52,7 @@ def test_builders_handle_minimal_dataframe():
 
 
 def test_update_figures_returns_all_slots():
-    figures = update_figs(None, None, None, None, None)
+    figures = update_figs(None, None, None, None, "Rad Section", None)
     assert isinstance(figures, tuple)
     assert len(figures) == 6
 
